@@ -25,15 +25,21 @@ var (
 			return true
 		},
 	}
+
 	streamerConnections = make(map[*websocket.Conn]*PeerConnectionContext)
 	streamerLock        sync.RWMutex
 )
 
 func main() {
-	http.HandleFunc(streamerWsPathDefault, handleStreamerConnections)
-	log.Printf("Server starting on %s...", serverAddrDefault)
+	os.MkdirAll("./hls-output", 0755)
 
+	http.HandleFunc(streamerWsPathDefault, handleStreamerConnections)
+	http.HandleFunc("/hls/", handleHLSRequest)
+	http.Handle("/", http.FileServer(http.Dir("./static/")))
+
+	log.Printf("Server starting on %s...", serverAddrDefault)
 	httpServer := &http.Server{Addr: serverAddrDefault}
+
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe error: %v", err)
@@ -45,6 +51,7 @@ func main() {
 	<-stop
 
 	log.Println("Shutting down server...")
+
 	streamerLock.Lock()
 	activeConnections := make([]*PeerConnectionContext, 0, len(streamerConnections))
 	for _, pcCtx := range streamerConnections {
@@ -59,10 +66,10 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 	defer cancel()
-
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
+
 	log.Println("Server gracefully stopped.")
 }
 
@@ -73,13 +80,14 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "clientId query parameter is required", http.StatusBadRequest)
 		return
 	}
-	clientID := clientIDs[0]
 
+	clientID := clientIDs[0]
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade connection for client %s: %v", clientID, err)
 		return
 	}
+
 	log.Printf("Streamer client connected: %s (Remote: %s)", clientID, ws.RemoteAddr())
 
 	pcContext, err := NewPeerConnectionContext(ws, clientID)
@@ -98,7 +106,6 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 	originalCloseHandler := ws.CloseHandler()
 	ws.SetCloseHandler(func(code int, text string) error {
 		log.Printf("Streamer client %s disconnected: Code %d, Text: %s", pcContext.GetID(), code, text)
-
 		pcContext.Close()
 
 		streamerLock.Lock()
@@ -110,4 +117,26 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+}
+
+func handleHLSRequest(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path[5:] // Remove "/hls/" prefix
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if len(path) > 5 && path[len(path)-5:] == ".m3u8" {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	} else if len(path) > 3 && path[len(path)-3:] == ".ts" {
+		w.Header().Set("Content-Type", "video/mp2t")
+	}
+
+	filePath := "./hls-output/" + path
+	http.ServeFile(w, r, filePath)
 }
