@@ -34,9 +34,9 @@ type CustomSessionDescription struct {
 
 type CustomICECandidateInit struct {
 	Candidate        string  `json:"candidate"`
-	SDPMid           string  `json:"sdpMid,omitempty"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
 	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
-	UsernameFragment string  `json:"usernameFragment,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
 }
 
 type DirectSignalPayloadClientToServer struct {
@@ -59,18 +59,32 @@ type ServerSignalPayload struct {
 	Candidate *CustomICECandidateInit   `json:"candidate,omitempty"`
 }
 
+// Global call session manager
+type CallSessionManager struct {
+	participants map[string]*PeerConnectionContext
+	videoWriters map[string]*ivfwriter.IVFWriter
+	audioWriters map[string]*oggwriter.OggWriter
+	videoFiles   map[string]*os.File
+	audioFiles   map[string]*os.File
+	hlsProcess   *exec.Cmd
+	isStreaming  bool
+	mutex        sync.RWMutex
+}
+
+var globalCallSession = &CallSessionManager{
+	participants: make(map[string]*PeerConnectionContext),
+	videoWriters: make(map[string]*ivfwriter.IVFWriter),
+	audioWriters: make(map[string]*oggwriter.OggWriter),
+	videoFiles:   make(map[string]*os.File),
+	audioFiles:   make(map[string]*os.File),
+}
+
 type PeerConnectionContext struct {
 	ws             *websocket.Conn
 	id             string
 	mu             sync.Mutex
 	isClosed       bool
 	peerConnection *webrtc.PeerConnection
-	videoWriter    *ivfwriter.IVFWriter
-	audioWriter    *oggwriter.OggWriter
-	hlsProcess     *exec.Cmd
-	videoFile      *os.File
-	audioFile      *os.File
-	isStreaming    bool
 }
 
 func NewPeerConnectionContext(ws *websocket.Conn, clientID string) (*PeerConnectionContext, error) {
@@ -78,6 +92,13 @@ func NewPeerConnectionContext(ws *websocket.Conn, clientID string) (*PeerConnect
 		ws: ws,
 		id: clientID,
 	}
+
+	// Add to global call session
+	globalCallSession.mutex.Lock()
+	globalCallSession.participants[clientID] = p
+	globalCallSession.mutex.Unlock()
+
+	log.Printf("Participant %s added to call. Total participants: %d", clientID, len(globalCallSession.participants))
 
 	return p, nil
 }
@@ -108,25 +129,18 @@ func (p *PeerConnectionContext) createServerPeerConnection() error {
 		if candidate != nil {
 			candidateJSON := candidate.ToJSON()
 
-			var sdpMid string
-			if candidateJSON.SDPMid != nil {
-				sdpMid = *candidateJSON.SDPMid
-			}
-
-			var usernameFragment string
-			if candidateJSON.UsernameFragment != nil {
-				usernameFragment = *candidateJSON.UsernameFragment
+			// Safely handle potentially nil pointers
+			customCandidate := &CustomICECandidateInit{
+				Candidate:        candidateJSON.Candidate,
+				SDPMid:           candidateJSON.SDPMid,
+				SDPMLineIndex:    candidateJSON.SDPMLineIndex,
+				UsernameFragment: candidateJSON.UsernameFragment,
 			}
 
 			p.sendMessage(Message{
 				Type: "server-candidate",
 				Payload: mustMarshal(ServerSignalPayload{
-					Candidate: &CustomICECandidateInit{
-						Candidate:        candidateJSON.Candidate,
-						SDPMid:           sdpMid,
-						SDPMLineIndex:    candidateJSON.SDPMLineIndex,
-						UsernameFragment: usernameFragment,
-					},
+					Candidate: customCandidate,
 				}),
 			})
 		}
@@ -141,11 +155,11 @@ func (p *PeerConnectionContext) createServerPeerConnection() error {
 		log.Printf("Peer %s: Server connection state changed: %s", p.id, state.String())
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
-			p.isStreaming = true
+			log.Printf("Peer %s: Connected to server", p.id)
 		case webrtc.PeerConnectionStateDisconnected,
 			webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			p.stopHLSTranscoding()
+			globalCallSession.removeParticipant(p.id)
 		}
 	})
 
@@ -160,51 +174,60 @@ func (p *PeerConnectionContext) handleIncomingTrack(track *webrtc.TrackRemote) {
 		}
 	}()
 
-	outputDir := fmt.Sprintf("./hls-output/%s", p.id)
+	outputDir := "./hls-output"
 	os.MkdirAll(outputDir, 0755)
 
 	if track.Kind() == webrtc.RTPCodecTypeVideo {
-		videoFilePath := fmt.Sprintf("%s/video.ivf", outputDir)
+		videoFilePath := fmt.Sprintf("%s/video_%s.ivf", outputDir, p.id)
 		videoFile, err := os.Create(videoFilePath)
 		if err != nil {
 			log.Printf("Peer %s: Error creating video file: %v", p.id, err)
 			return
 		}
-		p.videoFile = videoFile
+
+		globalCallSession.mutex.Lock()
+		globalCallSession.videoFiles[p.id] = videoFile
+		globalCallSession.mutex.Unlock()
 
 		videoWriter, err := ivfwriter.New(videoFilePath)
 		if err != nil {
 			log.Printf("Peer %s: Error creating video writer: %v", p.id, err)
 			return
 		}
-		p.videoWriter = videoWriter
+
+		globalCallSession.mutex.Lock()
+		globalCallSession.videoWriters[p.id] = videoWriter
+		globalCallSession.mutex.Unlock()
 
 		go p.saveVideoTrack(track)
+
 	} else if track.Kind() == webrtc.RTPCodecTypeAudio {
-		audioFilePath := fmt.Sprintf("%s/audio.ogg", outputDir)
+		audioFilePath := fmt.Sprintf("%s/audio_%s.ogg", outputDir, p.id)
 		audioFile, err := os.Create(audioFilePath)
 		if err != nil {
 			log.Printf("Peer %s: Error creating audio file: %v", p.id, err)
 			return
 		}
-		p.audioFile = audioFile
+
+		globalCallSession.mutex.Lock()
+		globalCallSession.audioFiles[p.id] = audioFile
+		globalCallSession.mutex.Unlock()
 
 		audioWriter, err := oggwriter.New(audioFilePath, 48000, 2)
 		if err != nil {
 			log.Printf("Peer %s: Error creating audio writer: %v", p.id, err)
 			return
 		}
-		p.audioWriter = audioWriter
+
+		globalCallSession.mutex.Lock()
+		globalCallSession.audioWriters[p.id] = audioWriter
+		globalCallSession.mutex.Unlock()
 
 		go p.saveAudioTrack(track)
 	}
 
-	if p.videoWriter != nil && p.audioWriter != nil && p.hlsProcess == nil {
-		go func() {
-			time.Sleep(2 * time.Second)
-			p.startHLSTranscoding()
-		}()
-	}
+	// Check if we should start composite streaming
+	globalCallSession.checkAndStartCompositeStream()
 }
 
 func (p *PeerConnectionContext) saveVideoTrack(track *webrtc.TrackRemote) {
@@ -215,8 +238,12 @@ func (p *PeerConnectionContext) saveVideoTrack(track *webrtc.TrackRemote) {
 			return
 		}
 
-		if p.videoWriter != nil {
-			err = p.videoWriter.WriteRTP(rtpPacket)
+		globalCallSession.mutex.RLock()
+		writer := globalCallSession.videoWriters[p.id]
+		globalCallSession.mutex.RUnlock()
+
+		if writer != nil {
+			err = writer.WriteRTP(rtpPacket)
 			if err != nil {
 				log.Printf("Peer %s: Error writing video RTP: %v", p.id, err)
 				return
@@ -233,8 +260,12 @@ func (p *PeerConnectionContext) saveAudioTrack(track *webrtc.TrackRemote) {
 			return
 		}
 
-		if p.audioWriter != nil {
-			err = p.audioWriter.WriteRTP(rtpPacket)
+		globalCallSession.mutex.RLock()
+		writer := globalCallSession.audioWriters[p.id]
+		globalCallSession.mutex.RUnlock()
+
+		if writer != nil {
+			err = writer.WriteRTP(rtpPacket)
 			if err != nil {
 				log.Printf("Peer %s: Error writing audio RTP: %v", p.id, err)
 				return
@@ -243,16 +274,59 @@ func (p *PeerConnectionContext) saveAudioTrack(track *webrtc.TrackRemote) {
 	}
 }
 
-func (p *PeerConnectionContext) startHLSTranscoding() {
-	outputDir := fmt.Sprintf("./hls-output/%s", p.id)
-	videoPath := fmt.Sprintf("%s/video.ivf", outputDir)
-	audioPath := fmt.Sprintf("%s/audio.ogg", outputDir)
+// CallSessionManager methods
+func (csm *CallSessionManager) checkAndStartCompositeStream() {
+	csm.mutex.Lock()
+	defer csm.mutex.Unlock()
+
+	// Need exactly 2 participants with both video and audio
+	if len(csm.participants) == 2 && len(csm.videoWriters) == 2 && len(csm.audioWriters) == 2 && !csm.isStreaming {
+		go func() {
+			time.Sleep(3 * time.Second) // Wait for streams to stabilize
+			csm.startCompositeHLS()
+		}()
+	}
+}
+
+func (csm *CallSessionManager) startCompositeHLS() {
+	csm.mutex.Lock()
+	defer csm.mutex.Unlock()
+
+	if csm.isStreaming || len(csm.videoWriters) < 2 || len(csm.audioWriters) < 2 {
+		return
+	}
+
+	outputDir := "./hls-output"
 	playlistPath := fmt.Sprintf("%s/playlist.m3u8", outputDir)
 
+	// Get participant IDs
+	var participant1, participant2 string
+	i := 0
+	for clientID := range csm.videoWriters {
+		if i == 0 {
+			participant1 = clientID
+		} else {
+			participant2 = clientID
+		}
+		i++
+	}
+
+	video1Path := fmt.Sprintf("%s/video_%s.ivf", outputDir, participant1)
+	audio1Path := fmt.Sprintf("%s/audio_%s.ogg", outputDir, participant1)
+	video2Path := fmt.Sprintf("%s/video_%s.ivf", outputDir, participant2)
+	audio2Path := fmt.Sprintf("%s/audio_%s.ogg", outputDir, participant2)
+
+	// FFmpeg command for side-by-side composition
 	cmd := exec.Command("ffmpeg",
 		"-re",
-		"-i", videoPath,
-		"-i", audioPath,
+		"-i", video1Path, // Video input 1
+		"-i", audio1Path, // Audio input 1
+		"-i", video2Path, // Video input 2
+		"-i", audio2Path, // Audio input 2
+		"-filter_complex",
+		"[0:v]scale=960:720[left];[2:v]scale=960:720[right];[left][right]hstack=inputs=2:shortest=1[v];[1:a][3:a]amix=inputs=2[a]",
+		"-map", "[v]", // Use composed video
+		"-map", "[a]", // Use mixed audio
 		"-c:v", "libx264",
 		"-c:a", "aac",
 		"-preset", "ultrafast",
@@ -267,96 +341,73 @@ func (p *PeerConnectionContext) startHLSTranscoding() {
 		playlistPath,
 	)
 
-	log.Printf("Peer %s: Starting HLS transcoding", p.id)
+	log.Printf("Starting composite HLS streaming for participants: %s and %s", participant1, participant2)
+	csm.hlsProcess = cmd
+	csm.isStreaming = true
 
-	p.hlsProcess = cmd
 	err := cmd.Start()
 	if err != nil {
-		log.Printf("Peer %s: Error starting HLS transcoding: %v", p.id, err)
+		log.Printf("Error starting composite HLS: %v", err)
+		csm.isStreaming = false
 		return
 	}
 
 	go func() {
 		err := cmd.Wait()
 		if err != nil {
-			log.Printf("Peer %s: HLS transcoding process ended with error: %v", p.id, err)
+			log.Printf("Composite HLS process ended with error: %v", err)
 		} else {
-			log.Printf("Peer %s: HLS transcoding process ended successfully", p.id)
+			log.Printf("Composite HLS process ended successfully")
 		}
+		csm.mutex.Lock()
+		csm.isStreaming = false
+		csm.mutex.Unlock()
 	}()
 }
 
-func (p *PeerConnectionContext) stopHLSTranscoding() {
-	if p.hlsProcess != nil {
-		log.Printf("Peer %s: Stopping HLS transcoding", p.id)
-		p.hlsProcess.Process.Kill()
-		p.hlsProcess = nil
+func (csm *CallSessionManager) removeParticipant(clientID string) {
+	csm.mutex.Lock()
+	defer csm.mutex.Unlock()
+
+	// Remove participant
+	delete(csm.participants, clientID)
+
+	// Close and remove writers
+	if writer, exists := csm.videoWriters[clientID]; exists {
+		writer.Close()
+		delete(csm.videoWriters, clientID)
 	}
 
-	if p.videoWriter != nil {
-		p.videoWriter.Close()
-		p.videoWriter = nil
+	if writer, exists := csm.audioWriters[clientID]; exists {
+		writer.Close()
+		delete(csm.audioWriters, clientID)
 	}
 
-	if p.audioWriter != nil {
-		p.audioWriter.Close()
-		p.audioWriter = nil
+	// Close and remove files
+	if file, exists := csm.videoFiles[clientID]; exists {
+		file.Close()
+		delete(csm.videoFiles, clientID)
 	}
 
-	if p.videoFile != nil {
-		p.videoFile.Close()
-		p.videoFile = nil
+	if file, exists := csm.audioFiles[clientID]; exists {
+		file.Close()
+		delete(csm.audioFiles, clientID)
 	}
 
-	if p.audioFile != nil {
-		p.audioFile.Close()
-		p.audioFile = nil
+	log.Printf("Participant %s removed from call. Remaining participants: %d", clientID, len(csm.participants))
+
+	// Stop streaming if no participants left
+	if len(csm.participants) == 0 {
+		csm.stopCompositeHLS()
 	}
 }
 
-func (p *PeerConnectionContext) HandleMessages() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Peer %s: Recovered in HandleMessages: %v", p.id, r)
-		}
-		p.Close()
-	}()
-
-	for {
-		if p.isContextClosed() {
-			return
-		}
-
-		messageTypeNum, rawMsg, err := p.ws.ReadMessage()
-		if err != nil {
-			if !p.isContextClosed() {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
-					log.Printf("Peer %s: WebSocket read error: %v. MessageType: %d", p.id, err, messageTypeNum)
-				} else {
-					log.Printf("Peer %s: WebSocket connection closed by client or network error. Code: %d, Error: %v", p.id, messageTypeNum, err)
-				}
-			}
-			return
-		}
-
-		log.Printf("Peer %s: RAW MESSAGE RECEIVED: %s", p.id, string(rawMsg))
-
-		var msg Message
-		if err := json.Unmarshal(rawMsg, &msg); err != nil {
-			log.Printf("Peer %s: Error unmarshalling message: %v. Raw: %s", p.id, err, string(rawMsg))
-			continue
-		}
-
-		switch msg.Type {
-		case "signal-initiate-p2p", "direct-offer", "direct-answer", "direct-candidate":
-			p.routeP2PMessage(msg)
-		case "server-offer":
-			p.handleServerOffer(msg)
-		case "server-candidate":
-			p.handleServerCandidate(msg)
-		default:
-			log.Printf("Peer %s: Unknown message type: %s", p.id, msg.Type)
-		}
+func (csm *CallSessionManager) stopCompositeHLS() {
+	if csm.hlsProcess != nil {
+		log.Printf("Stopping composite HLS streaming")
+		csm.hlsProcess.Process.Kill()
+		csm.hlsProcess = nil
+		csm.isStreaming = false
 	}
 }
 
@@ -424,9 +475,9 @@ func (p *PeerConnectionContext) handleServerCandidate(msg Message) {
 
 	candidate := webrtc.ICECandidateInit{
 		Candidate:        payload.Candidate.Candidate,
-		SDPMid:           &payload.Candidate.SDPMid,
+		SDPMid:           payload.Candidate.SDPMid,
 		SDPMLineIndex:    payload.Candidate.SDPMLineIndex,
-		UsernameFragment: &payload.Candidate.UsernameFragment,
+		UsernameFragment: payload.Candidate.UsernameFragment,
 	}
 
 	if err := p.peerConnection.AddICECandidate(candidate); err != nil {
@@ -457,8 +508,9 @@ func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
 
 	messageToRelay := Message{Type: msg.Type, Payload: marshaledRelayPayload}
 
-	streamerLock.RLock()
-	defer streamerLock.RUnlock()
+	// Use global call session instead of streamerConnections
+	globalCallSession.mutex.RLock()
+	defer globalCallSession.mutex.RUnlock()
 
 	if msg.Type == "signal-initiate-p2p" {
 		announcerID := p.id
@@ -484,13 +536,12 @@ func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
 
 		messageToBroadcast := Message{Type: "signal-initiate-p2p", Payload: marshaledBroadcastPayload}
 
-		for _, existingPeerCtx := range streamerConnections {
-			if existingPeerCtx.GetID() == announcerID {
+		for peerID, existingPeerCtx := range globalCallSession.participants {
+			if peerID == announcerID {
 				continue
 			}
-
 			targets = append(targets, existingPeerCtx)
-			existingPeerIDs = append(existingPeerIDs, existingPeerCtx.GetID())
+			existingPeerIDs = append(existingPeerIDs, peerID)
 			foundOtherPeers = true
 		}
 
@@ -523,22 +574,57 @@ func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
 			return
 		}
 
-		foundTarget := false
-		var targetCtx *PeerConnectionContext
-
-		for _, ctx := range streamerConnections {
-			if ctx.GetID() == targetPeerID {
-				targetCtx = ctx
-				foundTarget = true
-				break
-			}
-		}
-
-		if foundTarget && targetCtx != nil {
+		if targetCtx, exists := globalCallSession.participants[targetPeerID]; exists {
 			log.Printf("Peer %s routing P2P message '%s' (from %s) to target peer %s", p.id, msg.Type, relayPayload.FromPeerID, targetPeerID)
 			targetCtx.sendMessage(messageToRelay)
 		} else {
 			log.Printf("Peer %s: Target peer %s for P2P message type '%s' not found.", p.id, targetPeerID, msg.Type)
+		}
+	}
+}
+
+func (p *PeerConnectionContext) HandleMessages() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Peer %s: Recovered in HandleMessages: %v", p.id, r)
+		}
+		p.Close()
+	}()
+
+	for {
+		if p.isContextClosed() {
+			return
+		}
+
+		messageTypeNum, rawMsg, err := p.ws.ReadMessage()
+		if err != nil {
+			if !p.isContextClosed() {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
+					log.Printf("Peer %s: WebSocket read error: %v. MessageType: %d", p.id, err, messageTypeNum)
+				} else {
+					log.Printf("Peer %s: WebSocket connection closed by client or network error. Code: %d, Error: %v", p.id, messageTypeNum, err)
+				}
+			}
+			return
+		}
+
+		log.Printf("Peer %s: RAW MESSAGE RECEIVED: %s", p.id, string(rawMsg))
+
+		var msg Message
+		if err := json.Unmarshal(rawMsg, &msg); err != nil {
+			log.Printf("Peer %s: Error unmarshalling message: %v. Raw: %s", p.id, err, string(rawMsg))
+			continue
+		}
+
+		switch msg.Type {
+		case "signal-initiate-p2p", "direct-offer", "direct-answer", "direct-candidate":
+			p.routeP2PMessage(msg)
+		case "server-offer":
+			p.handleServerOffer(msg)
+		case "server-candidate":
+			p.handleServerCandidate(msg)
+		default:
+			log.Printf("Peer %s: Unknown message type: %s", p.id, msg.Type)
 		}
 	}
 }
@@ -568,12 +654,12 @@ func (p *PeerConnectionContext) Close() {
 
 	p.isClosed = true
 	log.Printf("Peer %s: Closing PeerConnectionContext...", p.id)
-
 	wsRef := p.ws
 	p.ws = nil
 	p.mu.Unlock()
 
-	p.stopHLSTranscoding()
+	// Remove from global call session
+	globalCallSession.removeParticipant(p.id)
 
 	if p.peerConnection != nil {
 		p.peerConnection.Close()

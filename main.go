@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
 	"os"
@@ -9,8 +10,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -26,15 +25,15 @@ var (
 		},
 	}
 
-	streamerConnections = make(map[*websocket.Conn]*PeerConnectionContext)
-	streamerLock        sync.RWMutex
+	currentCall *CallSession
+	callMutex   sync.RWMutex
 )
 
 func main() {
 	os.MkdirAll("./hls-output", 0755)
 
 	http.HandleFunc(streamerWsPathDefault, handleStreamerConnections)
-	http.HandleFunc("/hls/", handleHLSRequest)
+	http.HandleFunc("/hls/", handleHLSRequest) // No clientId needed
 	http.Handle("/", http.FileServer(http.Dir("./static/")))
 
 	log.Printf("Server starting on %s...", serverAddrDefault)
@@ -52,17 +51,12 @@ func main() {
 
 	log.Println("Shutting down server...")
 
-	streamerLock.Lock()
-	activeConnections := make([]*PeerConnectionContext, 0, len(streamerConnections))
-	for _, pcCtx := range streamerConnections {
-		activeConnections = append(activeConnections, pcCtx)
+	callMutex.Lock()
+	if currentCall != nil {
+		currentCall.Close()
+		currentCall = nil
 	}
-	streamerConnections = make(map[*websocket.Conn]*PeerConnectionContext)
-	streamerLock.Unlock()
-
-	for _, pcCtx := range activeConnections {
-		pcCtx.Close()
-	}
+	callMutex.Unlock()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 	defer cancel()
@@ -88,33 +82,34 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Streamer client connected: %s (Remote: %s)", clientID, ws.RemoteAddr())
+	log.Printf("Client connected: %s", clientID)
 
-	pcContext, err := NewPeerConnectionContext(ws, clientID)
+	callMutex.Lock()
+	if currentCall == nil {
+		currentCall = NewCallSession()
+	}
+	participant, err := currentCall.AddParticipant(ws, clientID)
+	callMutex.Unlock()
+
 	if err != nil {
-		log.Printf("Failed to create PeerConnectionContext for client %s: %v", clientID, err)
+		log.Printf("Failed to add participant %s: %v", clientID, err)
 		ws.Close()
 		return
 	}
 
-	streamerLock.Lock()
-	streamerConnections[ws] = pcContext
-	streamerLock.Unlock()
+	go participant.HandleMessages()
 
-	go pcContext.HandleMessages()
-
-	originalCloseHandler := ws.CloseHandler()
 	ws.SetCloseHandler(func(code int, text string) error {
-		log.Printf("Streamer client %s disconnected: Code %d, Text: %s", pcContext.GetID(), code, text)
-		pcContext.Close()
-
-		streamerLock.Lock()
-		delete(streamerConnections, ws)
-		streamerLock.Unlock()
-
-		if originalCloseHandler != nil {
-			return originalCloseHandler(code, text)
+		log.Printf("Client %s disconnected", clientID)
+		callMutex.Lock()
+		if currentCall != nil {
+			currentCall.RemoveParticipant(clientID)
+			if currentCall.IsEmpty() {
+				currentCall.Close()
+				currentCall = nil
+			}
 		}
+		callMutex.Unlock()
 		return nil
 	})
 }
