@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -24,16 +23,13 @@ var (
 			return true
 		},
 	}
-
-	currentCall *CallSession
-	callMutex   sync.RWMutex
 )
 
 func main() {
 	os.MkdirAll("./hls-output", 0755)
 
 	http.HandleFunc(streamerWsPathDefault, handleStreamerConnections)
-	http.HandleFunc("/hls/", handleHLSRequest) // No clientId needed
+	http.HandleFunc("/hls/", handleHLSRequest)
 	http.Handle("/", http.FileServer(http.Dir("./static/")))
 
 	log.Printf("Server starting on %s...", serverAddrDefault)
@@ -51,12 +47,12 @@ func main() {
 
 	log.Println("Shutting down server...")
 
-	callMutex.Lock()
-	if currentCall != nil {
-		currentCall.Close()
-		currentCall = nil
+	globalCallSession.mutex.Lock()
+	globalCallSession.stopCompositeHLS()
+	for clientID := range globalCallSession.participants {
+		globalCallSession.removeParticipant(clientID)
 	}
-	callMutex.Unlock()
+	globalCallSession.mutex.Unlock()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 	defer cancel()
@@ -84,15 +80,20 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Client connected: %s", clientID)
 
-	callMutex.Lock()
-	if currentCall == nil {
-		currentCall = NewCallSession()
-	}
-	participant, err := currentCall.AddParticipant(ws, clientID)
-	callMutex.Unlock()
+	globalCallSession.mutex.RLock()
+	participantCount := len(globalCallSession.participants)
+	globalCallSession.mutex.RUnlock()
 
+	if participantCount >= 2 {
+		log.Printf("Connection rejected: Maximum 2 participants allowed for composite streaming")
+		ws.WriteMessage(websocket.TextMessage, []byte(`{"error":"Call is full (max 2 participants)"}`))
+		ws.Close()
+		return
+	}
+
+	participant, err := NewPeerConnectionContext(ws, clientID)
 	if err != nil {
-		log.Printf("Failed to add participant %s: %v", clientID, err)
+		log.Printf("Failed to create participant %s: %v", clientID, err)
 		ws.Close()
 		return
 	}
@@ -101,21 +102,13 @@ func handleStreamerConnections(w http.ResponseWriter, r *http.Request) {
 
 	ws.SetCloseHandler(func(code int, text string) error {
 		log.Printf("Client %s disconnected", clientID)
-		callMutex.Lock()
-		if currentCall != nil {
-			currentCall.RemoveParticipant(clientID)
-			if currentCall.IsEmpty() {
-				currentCall.Close()
-				currentCall = nil
-			}
-		}
-		callMutex.Unlock()
+		globalCallSession.removeParticipant(clientID)
 		return nil
 	})
 }
 
 func handleHLSRequest(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path[5:] // Remove "/hls/" prefix
+	path := r.URL.Path[5:]
 
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -133,5 +126,22 @@ func handleHLSRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filePath := "./hls-output/" + path
+
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		if path == "playlist.m3u8" {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-ENDLIST
+`))
+			return
+		}
+		http.Error(w, "Stream not available", http.StatusNotFound)
+		return
+	}
+
 	http.ServeFile(w, r, filePath)
 }

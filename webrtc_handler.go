@@ -59,7 +59,6 @@ type ServerSignalPayload struct {
 	Candidate *CustomICECandidateInit   `json:"candidate,omitempty"`
 }
 
-// Global call session manager
 type CallSessionManager struct {
 	participants map[string]*PeerConnectionContext
 	videoWriters map[string]*ivfwriter.IVFWriter
@@ -93,7 +92,6 @@ func NewPeerConnectionContext(ws *websocket.Conn, clientID string) (*PeerConnect
 		id: clientID,
 	}
 
-	// Add to global call session
 	globalCallSession.mutex.Lock()
 	globalCallSession.participants[clientID] = p
 	globalCallSession.mutex.Unlock()
@@ -129,7 +127,6 @@ func (p *PeerConnectionContext) createServerPeerConnection() error {
 		if candidate != nil {
 			candidateJSON := candidate.ToJSON()
 
-			// Safely handle potentially nil pointers
 			customCandidate := &CustomICECandidateInit{
 				Candidate:        candidateJSON.Candidate,
 				SDPMid:           candidateJSON.SDPMid,
@@ -226,7 +223,6 @@ func (p *PeerConnectionContext) handleIncomingTrack(track *webrtc.TrackRemote) {
 		go p.saveAudioTrack(track)
 	}
 
-	// Check if we should start composite streaming
 	globalCallSession.checkAndStartCompositeStream()
 }
 
@@ -274,15 +270,14 @@ func (p *PeerConnectionContext) saveAudioTrack(track *webrtc.TrackRemote) {
 	}
 }
 
-// CallSessionManager methods
 func (csm *CallSessionManager) checkAndStartCompositeStream() {
 	csm.mutex.Lock()
 	defer csm.mutex.Unlock()
 
-	// Need exactly 2 participants with both video and audio
 	if len(csm.participants) == 2 && len(csm.videoWriters) == 2 && len(csm.audioWriters) == 2 && !csm.isStreaming {
+		log.Printf("Two participants with video/audio detected, starting composite stream in 5 seconds...")
 		go func() {
-			time.Sleep(3 * time.Second) // Wait for streams to stabilize
+			time.Sleep(5 * time.Second)
 			csm.startCompositeHLS()
 		}()
 	}
@@ -299,7 +294,6 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	outputDir := "./hls-output"
 	playlistPath := fmt.Sprintf("%s/playlist.m3u8", outputDir)
 
-	// Get participant IDs
 	var participant1, participant2 string
 	i := 0
 	for clientID := range csm.videoWriters {
@@ -309,6 +303,9 @@ func (csm *CallSessionManager) startCompositeHLS() {
 			participant2 = clientID
 		}
 		i++
+		if i >= 2 {
+			break
+		}
 	}
 
 	video1Path := fmt.Sprintf("%s/video_%s.ivf", outputDir, participant1)
@@ -316,32 +313,46 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	video2Path := fmt.Sprintf("%s/video_%s.ivf", outputDir, participant2)
 	audio2Path := fmt.Sprintf("%s/audio_%s.ogg", outputDir, participant2)
 
-	// FFmpeg command for side-by-side composition
+	if !csm.filesExistAndHaveContent(video1Path, audio1Path, video2Path, audio2Path) {
+		log.Printf("Input files don't exist or are empty. Retrying in 2 seconds...")
+		go func() {
+			time.Sleep(2 * time.Second)
+			csm.startCompositeHLS()
+		}()
+		return
+	}
+
+	os.Remove(playlistPath)
+
 	cmd := exec.Command("ffmpeg",
+		"-y",
 		"-re",
-		"-i", video1Path, // Video input 1
-		"-i", audio1Path, // Audio input 1
-		"-i", video2Path, // Video input 2
-		"-i", audio2Path, // Audio input 2
+		"-f", "ivf", "-i", video1Path,
+		"-f", "ogg", "-i", audio1Path,
+		"-f", "ivf", "-i", video2Path,
+		"-f", "ogg", "-i", audio2Path,
 		"-filter_complex",
-		"[0:v]scale=960:720[left];[2:v]scale=960:720[right];[left][right]hstack=inputs=2:shortest=1[v];[1:a][3:a]amix=inputs=2[a]",
-		"-map", "[v]", // Use composed video
-		"-map", "[a]", // Use mixed audio
+		"[0:v]scale=640:480[left];[2:v]scale=640:480[right];[left][right]hstack=inputs=2[v];[1:a][3:a]amix=inputs=2[a]",
+		"-map", "[v]",
+		"-map", "[a]",
 		"-c:v", "libx264",
 		"-c:a", "aac",
-		"-preset", "ultrafast",
+		"-preset", "veryfast",
 		"-tune", "zerolatency",
-		"-g", "30",
+		"-g", "60",
 		"-sc_threshold", "0",
 		"-f", "hls",
-		"-hls_time", "2",
-		"-hls_list_size", "5",
+		"-hls_time", "4",
+		"-hls_list_size", "10",
 		"-hls_flags", "delete_segments+append_list",
 		"-hls_allow_cache", "0",
+		"-hls_segment_filename", fmt.Sprintf("%s/segment_%%03d.ts", outputDir),
 		playlistPath,
 	)
 
 	log.Printf("Starting composite HLS streaming for participants: %s and %s", participant1, participant2)
+	log.Printf("Input files: %s, %s, %s, %s", video1Path, audio1Path, video2Path, audio2Path)
+
 	csm.hlsProcess = cmd
 	csm.isStreaming = true
 
@@ -356,6 +367,9 @@ func (csm *CallSessionManager) startCompositeHLS() {
 		err := cmd.Wait()
 		if err != nil {
 			log.Printf("Composite HLS process ended with error: %v", err)
+			if exitError, ok := err.(*exec.ExitError); ok {
+				log.Printf("FFmpeg stderr: %s", string(exitError.Stderr))
+			}
 		} else {
 			log.Printf("Composite HLS process ended successfully")
 		}
@@ -365,14 +379,28 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	}()
 }
 
+func (csm *CallSessionManager) filesExistAndHaveContent(paths ...string) bool {
+	for _, path := range paths {
+		stat, err := os.Stat(path)
+		if err != nil {
+			log.Printf("File %s does not exist: %v", path, err)
+			return false
+		}
+		if stat.Size() < 1024 {
+			log.Printf("File %s is too small (%d bytes)", path, stat.Size())
+			return false
+		}
+		log.Printf("File %s exists with size %d bytes", path, stat.Size())
+	}
+	return true
+}
+
 func (csm *CallSessionManager) removeParticipant(clientID string) {
 	csm.mutex.Lock()
 	defer csm.mutex.Unlock()
 
-	// Remove participant
 	delete(csm.participants, clientID)
 
-	// Close and remove writers
 	if writer, exists := csm.videoWriters[clientID]; exists {
 		writer.Close()
 		delete(csm.videoWriters, clientID)
@@ -383,7 +411,6 @@ func (csm *CallSessionManager) removeParticipant(clientID string) {
 		delete(csm.audioWriters, clientID)
 	}
 
-	// Close and remove files
 	if file, exists := csm.videoFiles[clientID]; exists {
 		file.Close()
 		delete(csm.videoFiles, clientID)
@@ -396,7 +423,6 @@ func (csm *CallSessionManager) removeParticipant(clientID string) {
 
 	log.Printf("Participant %s removed from call. Remaining participants: %d", clientID, len(csm.participants))
 
-	// Stop streaming if no participants left
 	if len(csm.participants) == 0 {
 		csm.stopCompositeHLS()
 	}
@@ -508,7 +534,6 @@ func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
 
 	messageToRelay := Message{Type: msg.Type, Payload: marshaledRelayPayload}
 
-	// Use global call session instead of streamerConnections
 	globalCallSession.mutex.RLock()
 	defer globalCallSession.mutex.RUnlock()
 
@@ -658,7 +683,6 @@ func (p *PeerConnectionContext) Close() {
 	p.ws = nil
 	p.mu.Unlock()
 
-	// Remove from global call session
 	globalCallSession.removeParticipant(p.id)
 
 	if p.peerConnection != nil {
