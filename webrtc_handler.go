@@ -101,6 +101,7 @@ func NewPeerConnectionContext(ws *websocket.Conn, clientID string) (*PeerConnect
 		ws: ws,
 		id: clientID,
 	}
+
 	globalCallSession.mutex.Lock()
 	globalCallSession.participants[clientID] = p
 	globalCallSession.mutex.Unlock()
@@ -189,7 +190,6 @@ func (p *PeerConnectionContext) handleIncomingTrack(track *webrtc.TrackRemote) {
 	if track.Kind() == webrtc.RTPCodecTypeVideo {
 		codecMimeType := strings.ToLower(track.Codec().MimeType)
 		log.Printf("Peer %s: Processing video track with MimeType: %s", p.id, codecMimeType)
-
 		var videoWriterInstance VideoWriter
 		var videoFilePath string
 		var videoFile *os.File
@@ -229,7 +229,6 @@ func (p *PeerConnectionContext) handleIncomingTrack(track *webrtc.TrackRemote) {
 		globalCallSession.videoFiles[p.id] = videoFile
 		globalCallSession.videoWriters[p.id] = videoWriterInstance
 		globalCallSession.mutex.Unlock()
-
 		go p.saveVideoTrack(track, videoWriterInstance)
 
 	} else if track.Kind() == webrtc.RTPCodecTypeAudio {
@@ -252,14 +251,11 @@ func (p *PeerConnectionContext) handleIncomingTrack(track *webrtc.TrackRemote) {
 			return
 		}
 		log.Printf("Peer %s: Created audio writer for %s (ClockRate: %d, Channels: %d)", p.id, audioFilePath, track.Codec().ClockRate, track.Codec().Channels)
-
 		globalCallSession.mutex.Lock()
 		globalCallSession.audioWriters[p.id] = audioWriter
 		globalCallSession.mutex.Unlock()
-
 		go p.saveAudioTrack(track, audioWriter)
 	}
-
 	globalCallSession.checkAndStartCompositeStream()
 }
 
@@ -320,6 +316,7 @@ func (csm *CallSessionManager) checkAndStartCompositeStream() {
 	if len(csm.participants) == 2 && len(csm.videoWriters) == 2 && len(csm.audioWriters) == 2 && !csm.isStreaming {
 		validParticipantsWithMedia := 0
 		var pIDs []string
+
 		for id := range csm.participants {
 			pIDs = append(pIDs, id)
 			_, hasVideo := csm.videoWriters[id]
@@ -330,19 +327,21 @@ func (csm *CallSessionManager) checkAndStartCompositeStream() {
 		}
 
 		if validParticipantsWithMedia == 2 {
-			log.Printf("Two participants (%s, %s) with video/audio detected, starting composite stream in 5 seconds...", pIDs[0], pIDs[1])
+			log.Printf("Two participants (%s, %s) with video/audio detected, preparing to start composite stream...", pIDs[0], pIDs[1])
 			csm.mutex.Unlock()
 			go func() {
-				time.Sleep(5 * time.Second)
+				time.Sleep(2 * time.Second)
 				csm.startCompositeHLS()
 			}()
 			return
 		} else {
-			log.Printf("Participant count is 2, but writer counts (%d video, %d audio) or valid media participants (%d) not ready.",
-				len(csm.videoWriters), len(csm.audioWriters), validParticipantsWithMedia)
+			log.Printf("Participant count is 2, but valid media participants (%d) not ready or writer counts incorrect (Video: %d, Audio: %d).",
+				validParticipantsWithMedia, len(csm.videoWriters), len(csm.audioWriters))
+			csm.mutex.Unlock()
 		}
+	} else {
+		csm.mutex.Unlock()
 	}
-	csm.mutex.Unlock()
 }
 
 func (csm *CallSessionManager) validateInputFiles(paths ...string) bool {
@@ -352,17 +351,52 @@ func (csm *CallSessionManager) validateInputFiles(paths ...string) bool {
 			log.Printf("File validation: File %s does not exist: %v", path, err)
 			return false
 		}
-		if stat.Size() < 2048 {
-			log.Printf("File validation: File %s is too small (%d bytes), expected at least 2048 bytes.", path, stat.Size())
+
+		if stat.Size() < 10240 {
+			log.Printf("File validation: File %s is too small (%d bytes), expected at least 10KB. Waiting for more data.", path, stat.Size())
+			return false
 		}
-		log.Printf("File validation: File %s exists with size %d bytes", path, stat.Size())
+		log.Printf("File validation: File %s exists with size %d bytes and appears stable.", path, stat.Size())
 	}
 	return true
 }
 
+func (csm *CallSessionManager) waitForSufficientData(paths ...string) bool {
+	maxWaitTime := 30 * time.Second
+	checkInterval := 1 * time.Second
+	startTime := time.Now()
+
+	log.Printf("Waiting for sufficient data in input files: %v", paths)
+
+	for time.Since(startTime) < maxWaitTime {
+		allFilesValidated := true
+		for _, path := range paths {
+			stat, err := os.Stat(path)
+			if err != nil {
+				allFilesValidated = false
+				break
+			}
+			if stat.Size() < 10240 {
+				allFilesValidated = false
+				break
+			}
+		}
+
+		if allFilesValidated {
+			log.Printf("All input files seem to have initial data. Proceeding with HLS start.")
+			return true
+		}
+
+		log.Printf("Waiting for files... Time elapsed: %v", time.Since(startTime))
+		time.Sleep(checkInterval)
+	}
+
+	log.Printf("Timeout waiting for sufficient data in input files after %v.", maxWaitTime)
+	return false
+}
+
 func (csm *CallSessionManager) startCompositeHLS() {
 	csm.mutex.Lock()
-
 	if csm.isStreaming {
 		log.Println("startCompositeHLS called but already streaming.")
 		csm.mutex.Unlock()
@@ -377,24 +411,22 @@ func (csm *CallSessionManager) startCompositeHLS() {
 
 	outputDir := "./hls-output"
 	playlistPath := fmt.Sprintf("%s/playlist.m3u8", outputDir)
-
 	var participantIDs []string
+
 	for clientID := range csm.participants {
 		if _, vOK := csm.videoWriters[clientID]; vOK {
 			if _, aOK := csm.audioWriters[clientID]; aOK {
 				participantIDs = append(participantIDs, clientID)
-				if len(participantIDs) == 2 {
-					break
-				}
 			}
 		}
 	}
 
 	if len(participantIDs) < 2 {
-		log.Printf("Could not identify two participants with both video and audio writers from active participants. Found %d.", len(participantIDs))
+		log.Printf("Could not identify two participants with both video and audio writers from active participants. Found %d valid participants.", len(participantIDs))
 		csm.mutex.Unlock()
 		return
 	}
+
 	participant1ID := participantIDs[0]
 	participant2ID := participantIDs[1]
 
@@ -417,8 +449,22 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	audio1Path := fmt.Sprintf("%s/audio_%s.ogg", outputDir, participant1ID)
 	audio2Path := fmt.Sprintf("%s/audio_%s.ogg", outputDir, participant2ID)
 
-	if !csm.validateInputFiles(video1Path, audio1Path, video2Path, audio2Path) {
-		log.Printf("Input file validation failed for HLS.")
+	csm.mutex.Unlock()
+
+	log.Printf("Waiting for sufficient data in input files: %s, %s, %s, %s", video1Path, audio1Path, video2Path, audio2Path)
+	if !csm.waitForSufficientData(video1Path, audio1Path, video2Path, audio2Path) {
+		log.Printf("Failed to get sufficient data for HLS streaming after waiting.")
+		return
+	}
+
+	csm.mutex.Lock()
+	if csm.isStreaming {
+		log.Println("startCompositeHLS: Streaming started by another process while waiting for data.")
+		csm.mutex.Unlock()
+		return
+	}
+	if len(csm.videoWriters) < 2 || len(csm.audioWriters) < 2 {
+		log.Printf("startCompositeHLS: Participant count changed while waiting for data. VideoW: %d, AudioW: %d", len(csm.videoWriters), len(csm.audioWriters))
 		csm.mutex.Unlock()
 		return
 	}
@@ -453,25 +499,27 @@ func (csm *CallSessionManager) startCompositeHLS() {
 
 	cmdArgs := []string{
 		"-y", "-re",
-		"-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+		"-fflags", "+genpts",
+		"-avoid_negative_ts", "make_zero",
+		"-thread_queue_size", "1024",
 		"-f", video1InputFormat, "-i", video1Path,
-		"-f", "ogg", "-i", audio1Path,
+		"-f", "ogg", "-thread_queue_size", "1024", "-i", audio1Path,
 		"-f", video2InputFormat, "-i", video2Path,
-		"-f", "ogg", "-i", audio2Path,
+		"-f", "ogg", "-thread_queue_size", "1024", "-i", audio2Path,
 		"-filter_complex",
 		"[0:v]scale=640:360,setpts=PTS-STARTPTS,fps=25[left];" +
 			"[2:v]scale=640:360,setpts=PTS-STARTPTS,fps=25[right];" +
-			"[left][right]hstack=inputs=2:shortest=1[v];" +
+			"[left][right]hstack=inputs=2[v];" +
 			"[1:a]asetpts=PTS-STARTPTS,volume=0.8[a1];" +
 			"[3:a]asetpts=PTS-STARTPTS,volume=0.8[a2];" +
-			"[a1][a2]amix=inputs=2:duration=shortest:normalize=0[a]",
+			"[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[a]",
 		"-map", "[v]", "-map", "[a]",
 		"-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
 		"-profile:v", "baseline", "-level", "3.1",
 		"-crf", "28", "-maxrate", "1000k", "-bufsize", "2000k",
 		"-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-forced-idr", "1",
 		"-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
-		"-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
+		"-f", "hls", "-hls_time", "2", "-hls_list_size", "10",
 		"-hls_flags", "delete_segments+append_list+omit_endlist",
 		"-hls_allow_cache", "0", "-hls_segment_type", "mpegts", "-start_number", "0",
 		"-hls_segment_filename", fmt.Sprintf("%s/segment_%%05d.ts", outputDir),
@@ -482,11 +530,8 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	log.Printf("Starting LOW-LATENCY composite HLS streaming for participants: %s (%s) and %s (%s)",
+	log.Printf("Attempting to start reliable composite HLS streaming for participants: %s (%s) and %s (%s)",
 		participant1ID, video1InputFormat, participant2ID, video2InputFormat)
-	log.Printf("FFmpeg command: ffmpeg %v", cmdArgs)
-	log.Printf("Input files: Video1: %s, Audio1: %s, Video2: %s, Audio2: %s",
-		video1Path, audio1Path, video2Path, audio2Path)
 
 	csm.hlsProcess = cmd
 	csm.isStreaming = true
@@ -502,30 +547,116 @@ func (csm *CallSessionManager) startCompositeHLS() {
 		csm.mutex.Unlock()
 		return
 	}
-	log.Printf("LOW-LATENCY Composite HLS FFmpeg process started with PID: %d", cmd.Process.Pid)
 
+	log.Printf("Composite HLS FFmpeg process started with PID: %d", cmd.Process.Pid)
+	go csm.monitorHLSProcess(cmd, &stderrBuf)
+}
+
+func (csm *CallSessionManager) monitorHLSProcess(cmd *exec.Cmd, stderrBuf *bytes.Buffer) {
+	processDone := make(chan error, 1)
 	go func() {
-		waitErr := cmd.Wait()
-		csm.mutex.Lock()
-		defer csm.mutex.Unlock()
-
-		if csm.hlsProcess != cmd {
-			log.Printf("FFmpeg process (PID: %d) finished, but a newer HLS process is active or none. Ignoring.", cmd.Process.Pid)
-			return
-		}
-
-		if waitErr != nil {
-			log.Printf("Composite HLS FFmpeg process (PID: %d) ended with error: %v", cmd.Process.Pid, waitErr)
-			log.Printf("FFmpeg stderr output (PID: %d):\n%s", cmd.Process.Pid, stderrBuf.String())
-			if exitError, ok := waitErr.(*exec.ExitError); ok {
-				log.Printf("FFmpeg exit code (PID: %d): %d", cmd.Process.Pid, exitError.ExitCode())
-			}
-		} else {
-			log.Printf("Composite HLS FFmpeg process (PID: %d) ended successfully.", cmd.Process.Pid)
-		}
-		csm.isStreaming = false
-		csm.hlsProcess = nil
+		processDone <- cmd.Wait()
 	}()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	pid := cmd.Process.Pid
+	log.Printf("monitorHLSProcess: Monitoring FFmpeg process PID: %d", pid)
+
+	for {
+		select {
+		case waitErr := <-processDone:
+			csm.mutex.Lock()
+			if csm.hlsProcess != cmd {
+				log.Printf("monitorHLSProcess (PID: %d): FFmpeg process ended, but it's no longer the active HLS process.", pid)
+				csm.mutex.Unlock()
+				return
+			}
+
+			currentParticipants := len(csm.participants)
+			currentVideoWriters := len(csm.videoWriters)
+			currentAudioWriters := len(csm.audioWriters)
+
+			if waitErr != nil {
+				log.Printf("monitorHLSProcess (PID: %d): Composite HLS FFmpeg process ended with error: %v", pid, waitErr)
+				log.Printf("FFmpeg stderr output (PID: %d):\n%s", pid, stderrBuf.String())
+
+				if currentParticipants >= 2 && currentVideoWriters >= 2 && currentAudioWriters >= 2 {
+					log.Printf("monitorHLSProcess (PID: %d): Participants/writers still seem present (P:%d, V:%d, A:%d). Attempting restart...",
+						pid, currentParticipants, currentVideoWriters, currentAudioWriters)
+					csm.isStreaming = false
+					csm.hlsProcess = nil
+					csm.mutex.Unlock()
+					go func() {
+						time.Sleep(5 * time.Second)
+						log.Println("monitorHLSProcess: Initiating HLS restart after unexpected termination with error.")
+						csm.startCompositeHLS()
+					}()
+					return
+				} else {
+					log.Printf("monitorHLSProcess (PID: %d): FFmpeg ended with error and insufficient participants/writers remain (P:%d, V:%d, A:%d). Not restarting.",
+						pid, currentParticipants, currentVideoWriters, currentAudioWriters)
+				}
+			} else {
+				if currentParticipants >= 2 && currentVideoWriters >= 2 && currentAudioWriters >= 2 {
+					log.Printf("monitorHLSProcess (PID: %d): FFmpeg ended successfully but participants/writers still seem present (P:%d, V:%d, A:%d). Attempting restart as this is premature.",
+						pid, currentParticipants, currentVideoWriters, currentAudioWriters)
+					csm.isStreaming = false
+					csm.hlsProcess = nil
+					csm.mutex.Unlock()
+					go func() {
+						time.Sleep(3 * time.Second)
+						log.Println("monitorHLSProcess: Restarting HLS after unexpected successful termination with participants/writers still connected.")
+						csm.startCompositeHLS()
+					}()
+					return
+				} else {
+					log.Printf("monitorHLSProcess (PID: %d): FFmpeg ended successfully. Participants/writers remaining: P:%d, V:%d, A:%d. Expected shutdown.", pid, currentParticipants, currentVideoWriters, currentAudioWriters)
+				}
+			}
+
+			csm.isStreaming = false
+			csm.hlsProcess = nil
+			csm.mutex.Unlock()
+			return
+
+		case <-ticker.C:
+			csm.mutex.RLock()
+			isStillStreaming := csm.isStreaming
+			participantCount := len(csm.participants)
+			videoWriterCount := len(csm.videoWriters)
+			audioWriterCount := len(csm.audioWriters)
+			hlsPlaylistPath := "./hls-output/playlist.m3u8"
+			csm.mutex.RUnlock()
+
+			if isStillStreaming {
+				if participantCount < 2 || videoWriterCount < 2 || audioWriterCount < 2 {
+					log.Printf("monitorHLSProcess (PID: %d): Participant/writer count dropped below threshold (P:%d, V:%d, A:%d). Stopping FFmpeg.",
+						pid, participantCount, videoWriterCount, audioWriterCount)
+
+					csm.mutex.Lock()
+					if csm.hlsProcess == cmd && cmd.Process != nil {
+						log.Printf("monitorHLSProcess (PID: %d): Sending SIGINT to FFmpeg to stop it.", pid)
+						if err := cmd.Process.Signal(os.Interrupt); err != nil {
+							log.Printf("monitorHLSProcess (PID: %d): Failed to send SIGINT, forcing kill: %v", pid, err)
+							if killErr := cmd.Process.Kill(); killErr != nil {
+								log.Printf("monitorHLSProcess: Failed to kill FFmpeg after SIGINT failure: %v", killErr)
+							}
+						}
+					}
+					csm.mutex.Unlock()
+				}
+
+				stat, err := os.Stat(hlsPlaylistPath)
+				if err != nil {
+					log.Printf("monitorHLSProcess (PID: %d): Playlist health check: %s not found.", pid, hlsPlaylistPath)
+				} else if time.Since(stat.ModTime()) > 30*time.Second {
+					log.Printf("monitorHLSProcess (PID: %d): Playlist %s not updated recently (ModTime: %v). FFmpeg might be stalled.", pid, hlsPlaylistPath, stat.ModTime())
+				}
+			}
+		}
+	}
 }
 
 func (csm *CallSessionManager) removeParticipant(clientID string) {
@@ -533,7 +664,6 @@ func (csm *CallSessionManager) removeParticipant(clientID string) {
 	defer csm.mutex.Unlock()
 
 	log.Printf("Removing participant %s", clientID)
-
 	delete(csm.participants, clientID)
 
 	if writer, exists := csm.videoWriters[clientID]; exists {
@@ -558,7 +688,6 @@ func (csm *CallSessionManager) removeParticipant(clientID string) {
 			log.Printf("Error closing video file %s for %s: %v", filePath, clientID, err)
 		}
 		delete(csm.videoFiles, clientID)
-		// os.Remove(filePath)
 		log.Printf("Closed video file %s for %s", filePath, clientID)
 	}
 
@@ -568,32 +697,46 @@ func (csm *CallSessionManager) removeParticipant(clientID string) {
 			log.Printf("Error closing audio file %s for %s: %v", filePath, clientID, err)
 		}
 		delete(csm.audioFiles, clientID)
-		// os.Remove(filePath)
 		log.Printf("Closed audio file %s for %s", filePath, clientID)
 	}
 
-	log.Printf("Participant %s removed. Remaining participants: %d, VideoWriters: %d, AudioWriters: %d",
-		clientID, len(csm.participants), len(csm.videoWriters), len(csm.audioWriters))
+	remainingParticipants := len(csm.participants)
+	remainingVideoWriters := len(csm.videoWriters)
+	remainingAudioWriters := len(csm.audioWriters)
 
-	if len(csm.participants) < 2 || len(csm.videoWriters) < 2 || len(csm.audioWriters) < 2 {
+	log.Printf("Participant %s removed. Remaining participants: %d, VideoWriters: %d, AudioWriters: %d",
+		clientID, remainingParticipants, remainingVideoWriters, remainingAudioWriters)
+
+	if remainingParticipants < 2 || remainingVideoWriters < 2 || remainingAudioWriters < 2 {
 		if csm.isStreaming && csm.hlsProcess != nil {
-			log.Printf("Conditions for streaming no longer met after removing %s. Stopping HLS.", clientID)
+			log.Printf("STOPPING HLS: Insufficient participants/writers after removing %s (P:%d, V:%d, A:%d)",
+				clientID, remainingParticipants, remainingVideoWriters, remainingAudioWriters)
 			csm.stopCompositeHLSLocked()
 		}
+	} else {
+		log.Printf("HLS CONTINUES: Sufficient participants/writers remain after removing %s (P:%d, V:%d, A:%d)",
+			clientID, remainingParticipants, remainingVideoWriters, remainingAudioWriters)
 	}
 }
 
 func (csm *CallSessionManager) stopCompositeHLSLocked() {
 	if csm.hlsProcess != nil && csm.hlsProcess.Process != nil {
-		log.Printf("Stopping composite HLS process (PID: %d)", csm.hlsProcess.Process.Pid)
+		pid := csm.hlsProcess.Process.Pid
+		log.Printf("Stopping composite HLS process (PID: %d)", pid)
 		if err := csm.hlsProcess.Process.Signal(os.Interrupt); err != nil {
-			log.Printf("Failed to send SIGINT to FFmpeg process (PID: %d): %v. Attempting to kill.", csm.hlsProcess.Process.Pid, err)
+			log.Printf("Failed to send SIGINT to FFmpeg process (PID: %d): %v. Attempting to kill.", pid, err)
 			if killErr := csm.hlsProcess.Process.Kill(); killErr != nil {
-				log.Printf("Failed to kill FFmpeg process (PID: %d): %v", csm.hlsProcess.Process.Pid, killErr)
+				log.Printf("Failed to kill FFmpeg process (PID: %d): %v", pid, killErr)
+			} else {
+				log.Printf("Killed FFmpeg process (PID: %d)", pid)
 			}
+		} else {
+			log.Printf("Sent SIGINT to FFmpeg process (PID: %d)", pid)
 		}
 	} else {
-		log.Println("stopCompositeHLSLocked called, but no HLS process or process state found to stop.")
+		log.Println("stopCompositeHLSLocked called, but HLS process was not running or already stopped.")
+		csm.isStreaming = false
+		csm.hlsProcess = nil
 	}
 }
 
@@ -628,6 +771,7 @@ func (p *PeerConnectionContext) handleServerOffer(msg Message) {
 		pc = p.peerConnection
 		p.mu.Unlock()
 	}
+
 	if pc == nil {
 		log.Printf("Peer %s: Peer connection is nil even after creation attempt. Cannot handle server offer.", p.id)
 		return
@@ -637,7 +781,6 @@ func (p *PeerConnectionContext) handleServerOffer(msg Message) {
 		Type: webrtc.SDPTypeOffer,
 		SDP:  payload.SDP.SDP,
 	}
-
 	if err := pc.SetRemoteDescription(sdp); err != nil {
 		log.Printf("Peer %s: Error setting remote description from client's offer: %v", p.id, err)
 		return
@@ -648,7 +791,6 @@ func (p *PeerConnectionContext) handleServerOffer(msg Message) {
 		log.Printf("Peer %s: Error creating answer to client's offer: %v", p.id, err)
 		return
 	}
-
 	if err := pc.SetLocalDescription(answer); err != nil {
 		log.Printf("Peer %s: Error setting local description for answer: %v", p.id, err)
 		return
@@ -689,8 +831,7 @@ func (p *PeerConnectionContext) handleServerCandidate(msg Message) {
 	}
 
 	if pc.RemoteDescription() == nil {
-		log.Printf("Peer %s: Remote description not set yet, cannot add ICE candidate. Client should queue or server should implement queuing.", p.id)
-		return
+		log.Printf("Peer %s: Remote description not set yet, AddICECandidate will queue if supported or might error.", p.id)
 	}
 
 	if err := pc.AddICECandidate(candidate); err != nil {
@@ -858,10 +999,13 @@ func (p *PeerConnectionContext) Close() {
 	}
 	p.isClosed = true
 	log.Printf("Peer %s: Closing PeerConnectionContext...", p.id)
+
 	wsRef := p.ws
 	p.ws = nil
+
 	peerConnRef := p.peerConnection
 	p.peerConnection = nil
+
 	p.mu.Unlock()
 
 	globalCallSession.removeParticipant(p.id)
