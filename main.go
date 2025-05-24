@@ -33,7 +33,9 @@ func main() {
 	http.Handle("/", http.FileServer(http.Dir("./static/")))
 
 	log.Printf("Server starting on %s...", serverAddrDefault)
-	httpServer := &http.Server{Addr: serverAddrDefault}
+	httpServer := &http.Server{
+		Addr: serverAddrDefault,
+	}
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {

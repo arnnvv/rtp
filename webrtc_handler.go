@@ -129,7 +129,11 @@ func (p *PeerConnectionContext) createServerPeerConnection() error {
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
+			{
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+				},
+			},
 		},
 	}
 
@@ -450,13 +454,10 @@ func (csm *CallSessionManager) startCompositeHLS() {
 	cmdArgs := []string{
 		"-y", "-re",
 		"-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
-
 		"-f", video1InputFormat, "-i", video1Path,
 		"-f", "ogg", "-i", audio1Path,
-
 		"-f", video2InputFormat, "-i", video2Path,
 		"-f", "ogg", "-i", audio2Path,
-
 		"-filter_complex",
 		"[0:v]scale=640:360,setpts=PTS-STARTPTS,fps=25[left];" +
 			"[2:v]scale=640:360,setpts=PTS-STARTPTS,fps=25[right];" +
@@ -757,7 +758,10 @@ func (p *PeerConnectionContext) routeP2PMessage(msg Message) {
 				log.Printf("Error marshalling 'signal-initiate-p2p' payload for announcer %s about existing peer %s: %v", announcerID, existingPeerID, mErr)
 				continue
 			}
-			msgForAnnouncer := Message{Type: "signal-initiate-p2p", Payload: marshaledPayloadForAnnouncer}
+			msgForAnnouncer := Message{
+				Type:    "signal-initiate-p2p",
+				Payload: marshaledPayloadForAnnouncer,
+			}
 			log.Printf("Existing peer %s signaling 'signal-initiate-p2p' back to new peer %s (announcer)", existingPeerID, announcerID)
 			p.sendMessage(msgForAnnouncer)
 		}
