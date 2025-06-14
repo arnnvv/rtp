@@ -92,6 +92,7 @@ type PeerConnectionContext struct {
 	ws             *websocket.Conn
 	id             string
 	mu             sync.Mutex
+	wsWriteMutex   sync.Mutex
 	isClosed       bool
 	peerConnection *webrtc.PeerConnection
 }
@@ -985,6 +986,9 @@ func (p *PeerConnectionContext) sendMessage(msg Message) {
 	if isCtxClosed || wsRef == nil {
 		return
 	}
+
+	p.wsWriteMutex.Lock()
+	defer p.wsWriteMutex.Unlock()
 
 	if err := wsRef.WriteJSON(msg); err != nil {
 		log.Printf("Peer %s: Error writing JSON (type: %s) to WebSocket: %v", p.id, msg.Type, err)
